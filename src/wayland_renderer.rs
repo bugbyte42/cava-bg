@@ -39,7 +39,7 @@ use wgpu::util::DeviceExt;
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -77,17 +77,37 @@ fn cava_config_hash(config: &Config) -> u64 {
     h.finish()
 }
 
+/// Owns the CAVA child from spawn through renderer shutdown or recovery.
+struct CavaProcess {
+    child: Child,
+}
+
+impl Drop for CavaProcess {
+    fn drop(&mut self) {
+        // try_wait also reaps children that exited before renderer teardown.
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        if let Err(e) = self.child.kill() {
+            warn!("Failed to stop cava during teardown: {e}");
+        }
+        if let Err(e) = self.child.wait() {
+            warn!("Failed to reap cava during teardown: {e}");
+        }
+    }
+}
+
 /// Spawns the `cava` CLI with the given config piped via stdin.
 ///
 /// cava's stderr is captured and forwarded to the log, and an early-exit probe
 /// detects immediate failures (missing binary, unloadable shared libraries
 /// such as libcava, or a rejected config) so they surface as actionable errors
 /// instead of a silent, frozen visualizer.
-fn spawn_cava_process(config: &Config) -> Result<std::process::Child> {
+fn spawn_cava_process(config: &Config) -> Result<CavaProcess> {
     let cava_config_str = build_cava_config(config);
     debug!("cava config:\n{}", cava_config_str);
 
-    let mut cmd = Command::new("cava")
+    let child = Command::new("cava")
         .arg("-p")
         .arg("/dev/stdin")
         .stdout(Stdio::piped())
@@ -95,15 +115,17 @@ fn spawn_cava_process(config: &Config) -> Result<std::process::Child> {
         .stderr(Stdio::piped())
         .spawn()
         .context("Failed to spawn cava process. Is cava installed and in PATH?")?;
+    // Install cleanup before any fallible pipe setup or initialization.
+    let mut cmd = CavaProcess { child };
 
-    if let Some(mut stdin) = cmd.stdin.take() {
+    if let Some(mut stdin) = cmd.child.stdin.take() {
         stdin
             .write_all(cava_config_str.as_bytes())
             .context("Failed to write config to cava stdin")?;
         stdin.flush()?;
     }
 
-    if let Some(stderr) = cmd.stderr.take() {
+    if let Some(stderr) = cmd.child.stderr.take() {
         thread::spawn(move || {
             use std::io::BufRead;
             let mut reader = BufReader::new(stderr);
@@ -127,7 +149,7 @@ fn spawn_cava_process(config: &Config) -> Result<std::process::Child> {
     // Brief probe: if cava dies right after startup (e.g. shared library load
     // errors or an unsupported config option), report it instead of hanging.
     thread::sleep(Duration::from_millis(150));
-    if let Ok(Some(status)) = cmd.try_wait() {
+    if let Ok(Some(status)) = cmd.child.try_wait() {
         anyhow::bail!(
             "cava exited immediately with {}. Check that the cava binary runs \
              standalone (`cava -v`) and that its shared libraries resolve.",
@@ -528,8 +550,6 @@ pub struct WaylandRenderer {
     config_recovery: ConfigRecovery,
     running: Arc<AtomicBool>,
     config_path: Option<PathBuf>,
-    cava_handle: Option<std::process::Child>,
-    last_cava_config_hash: u64,
     supervised: bool,
 }
 
@@ -546,8 +566,6 @@ impl WaylandRenderer {
             config_recovery,
             running,
             config_path,
-            cava_handle: None,
-            last_cava_config_hash: 0,
             supervised,
         }
     }
@@ -804,7 +822,7 @@ impl WaylandRenderer {
         Ok((texture, view, width, height))
     }
 
-    pub fn run(mut self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
         info!("Starting cava-bg with wgpu backend");
 
         let mut cmd = spawn_cava_process(&self.config)?;
@@ -827,13 +845,14 @@ impl WaylandRenderer {
                 color_update_tx,
             );
         }
-        let cava_stdout = cmd.stdout.take().context("Failed to get cava stdout")?;
+        let cava_stdout = cmd
+            .child
+            .stdout
+            .take()
+            .context("Failed to get cava stdout")?;
         let bar_count = self.config.audio.bar_count as usize;
         let bar_alpha = self.config.audio.bar_alpha;
         let silence_threshold = self.config.performance.idle_mode.audio_threshold.max(0.0);
-
-        self.cava_handle = Some(cmd);
-        self.last_cava_config_hash = cava_config_hash(&self.config);
 
         let (cava_tx, cava_rx): (Sender<CavaFramePacket>, Receiver<CavaFramePacket>) = channel();
         spawn_cava_reader(cava_stdout, bar_count, silence_threshold, cava_tx);
@@ -1085,10 +1104,8 @@ impl WaylandRenderer {
                 .prescale_max_dimension
                 .max(512),
             xray_generate_mipmaps: self.config.performance.xray.generate_mipmaps,
-            cava_handle: None,
-            // cava_tx kept on the channel for restart,
-            // no need to store on AppState
-            last_cava_config_hash: self.last_cava_config_hash,
+            cava_handle: Some(cmd),
+            last_cava_config_hash: cava_config_hash(&self.config),
             gradient_dir: match self.config.colors.gradient_direction {
                 crate::app_config::GradientDirection::BottomToTop => 0.0,
                 crate::app_config::GradientDirection::TopToBottom => 1.0,
@@ -1109,7 +1126,12 @@ impl WaylandRenderer {
             }
         }
 
+        let loop_signal = event_loop.get_signal();
         event_loop.run(Some(event_tick), &mut app_state, |state| {
+            if !state.running.load(Ordering::SeqCst) {
+                loop_signal.stop();
+                return;
+            }
             heartbeat_tick();
             if let Ok(new_framerate) = state.framerate_receiver.try_recv() {
                 state.framerate = new_framerate;
@@ -1135,10 +1157,6 @@ impl WaylandRenderer {
 
             while let Ok(color_update) = state.color_update_receiver.try_recv() {
                 state.apply_color_update(color_update);
-            }
-
-            if !state.running.load(Ordering::SeqCst) {
-                std::process::exit(0);
             }
 
             if let Ok(new_colors) = state.color_receiver.try_recv() {
@@ -1423,7 +1441,7 @@ struct AppState {
     xray_prescale_max_dimension: u32,
     xray_generate_mipmaps: bool,
     // CAVA process handle for hot-reload
-    cava_handle: Option<std::process::Child>,
+    cava_handle: Option<CavaProcess>,
     last_cava_config_hash: u64,
 }
 
@@ -1895,14 +1913,11 @@ impl AppState {
         let new_hash = cava_config_hash(&new_config);
         if new_hash != 0 && new_hash != self.last_cava_config_hash {
             info!("CAVA config changed, restarting cava process");
-            if let Some(mut child) = self.cava_handle.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+            drop(self.cava_handle.take());
             match spawn_cava_process(&new_config) {
                 Ok(mut child) => {
                     // Create new reader thread for the new pipe
-                    if let Some(cava_stdout) = child.stdout.take() {
+                    if let Some(cava_stdout) = child.child.stdout.take() {
                         let (new_tx, new_rx): (Sender<CavaFramePacket>, Receiver<CavaFramePacket>) =
                             channel();
                         spawn_cava_reader(
@@ -4258,5 +4273,130 @@ mod tests {
         assert!(capacity <= limit);
         assert_eq!(bar_vertex_buffer_capacity(capacity, 0, limit), capacity);
         assert_eq!(bar_vertex_buffer_capacity(0, u64::MAX, u64::MAX), u64::MAX);
+    }
+}
+
+#[cfg(test)]
+mod cava_teardown_tests {
+    use super::*;
+
+    fn spawn_test_process(script: &str) -> CavaProcess {
+        CavaProcess {
+            child: Command::new("/bin/sh")
+                .args(["-c", script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn test child"),
+        }
+    }
+
+    fn assert_reaped(pid: u32) {
+        let mut status = 0;
+        // Each test checks only the child PID it created.
+        let result = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        assert_eq!(result, -1, "child {pid} was still running or not reaped");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[test]
+    fn normal_drop_stops_and_reaps_child() {
+        let process = spawn_test_process("exec sleep 30");
+        let pid = process.child.id();
+        drop(process);
+        assert_reaped(pid);
+    }
+
+    #[test]
+    fn initialization_error_stops_and_reaps_child() {
+        let mut pid = 0;
+        let result: Result<()> = (|| {
+            let process = spawn_test_process("exec sleep 30");
+            pid = process.child.id();
+            anyhow::bail!("simulated initialization failure");
+        })();
+        assert!(result.is_err());
+        assert_reaped(pid);
+    }
+
+    #[test]
+    fn panic_stops_and_reaps_child() {
+        let mut pid = 0;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let process = spawn_test_process("exec sleep 30");
+            pid = process.child.id();
+            panic!("simulated renderer panic");
+        }));
+        assert!(result.is_err());
+        assert_reaped(pid);
+    }
+
+    #[test]
+    fn already_exited_child_is_reaped() {
+        let process = spawn_test_process("exit 0");
+        let pid = process.child.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            if stat.split_once(") ").unwrap().1.starts_with('Z') {
+                break;
+            }
+            assert!(Instant::now() < deadline, "test child did not exit");
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(process);
+        assert_reaped(pid);
+    }
+
+    #[test]
+    fn repeated_replacement_reaps_each_previous_child() {
+        let mut current = Some(spawn_test_process("exec sleep 30"));
+        for _ in 0..12 {
+            let previous_pid = current.as_ref().unwrap().child.id();
+            drop(current.take());
+            assert_reaped(previous_pid);
+            current = Some(spawn_test_process("exec sleep 30"));
+        }
+        let last_pid = current.as_ref().unwrap().child.id();
+        drop(current);
+        assert_reaped(last_pid);
+    }
+
+    #[test]
+    fn teardown_releases_blocked_audio_reader() {
+        let mut process = spawn_test_process("exec sleep 30");
+        let pid = process.child.id();
+        let stdout = process.child.stdout.take().unwrap();
+        let (tx, rx) = channel();
+        spawn_cava_reader(stdout, 8, 0.01, tx);
+        drop(process);
+        assert_reaped(pid);
+        let packet = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(packet.silent);
+        assert_eq!(packet.bars, vec![0.0; 8]);
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn event_loop_stop_returns_and_reaps_child() {
+        let mut event_loop = EventLoop::<CavaProcess>::try_new().unwrap();
+        let signal = event_loop.get_signal();
+        let pid;
+        {
+            let mut process = spawn_test_process("exec sleep 30");
+            pid = process.child.id();
+            event_loop
+                .run(Duration::ZERO, &mut process, |_| signal.stop())
+                .unwrap();
+        }
+        assert_reaped(pid);
     }
 }
