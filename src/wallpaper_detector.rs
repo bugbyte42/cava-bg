@@ -8,8 +8,11 @@ use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::{ErrorKind, Read};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
@@ -137,6 +140,7 @@ pub fn get_current_wallpaper() -> Option<PathBuf> {
 
     // Priority 1: IPC/direct commands
     let priority_1: &[(&str, fn() -> Option<PathBuf>)] = &[
+        ("Noctalia v5 IPC", from_noctalia_ipc),
         ("awww query", from_awww_query),
         ("hyprpaper IPC (hyprctl)", from_hyprpaper_ipc),
         ("wpaperd IPC (wpaperctl)", from_wpaperd_ipc),
@@ -376,6 +380,81 @@ fn detect_compositor_with_env(env_info: &WaylandEnvironment) -> Option<String> {
     }
 
     None
+}
+
+fn from_noctalia_ipc() -> Option<PathBuf> {
+    query_noctalia_wallpaper(Command::new("noctalia"), Duration::from_millis(500))
+}
+
+fn query_noctalia_wallpaper(mut command: Command, timeout: Duration) -> Option<PathBuf> {
+    const MAX_RESPONSE_BYTES: usize = 8192;
+
+    let mut child = command
+        .args(["msg", "wallpaper-get"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let started = Instant::now();
+    let result = (|| {
+        let mut stdout = child.stdout.take()?;
+        let fd = stdout.as_raw_fd();
+        // SAFETY: stdout owns this valid descriptor throughout both fcntl calls.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return None;
+        }
+
+        let mut response = Vec::new();
+        let mut status = None;
+        let mut eof = false;
+        while started.elapsed() < timeout {
+            if status.is_none() {
+                status = child.try_wait().ok()?;
+            }
+            if status.is_some_and(|status| !status.success()) {
+                return None;
+            }
+            let mut buffer = [0; 1024];
+            match stdout.read(&mut buffer) {
+                Ok(0) => eof = true,
+                Ok(count) => {
+                    if response.len() + count > MAX_RESPONSE_BYTES {
+                        return None;
+                    }
+                    response.extend_from_slice(&buffer[..count]);
+                    continue;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            }
+            if eof && status.is_some() {
+                return parse_noctalia_wallpaper(&response);
+            }
+            thread::sleep(Duration::from_millis(5).min(timeout.saturating_sub(started.elapsed())));
+        }
+        None
+    })();
+    // Stop and reap the child on every exit, including timeout and read errors.
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+fn parse_noctalia_wallpaper(response: &[u8]) -> Option<PathBuf> {
+    let text = std::str::from_utf8(response).ok()?;
+    // Remove only the CLI line ending. Keep spaces, quotes, and shell characters.
+    let text = text
+        .strip_suffix('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .unwrap_or(text);
+    if text.is_empty() || text.starts_with("color:") || text.contains(['\n', '\r', '\0']) {
+        return None;
+    }
+    let path = PathBuf::from(text);
+    (path.is_absolute() && path.is_file() && is_media_file_path(&path)).then_some(path)
 }
 
 fn from_awww_query() -> Option<PathBuf> {
@@ -1340,6 +1419,142 @@ fn vlog(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoctaliaFixture(PathBuf);
+
+    impl NoctaliaFixture {
+        fn new() -> Self {
+            static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = env::temp_dir().join(format!("cava-bg-noctalia-{}-{id}", std::process::id()));
+            fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn media(&self) -> PathBuf {
+            let path = self.0.join("wallpaper 'quote\" $(); & [space].PNG");
+            fs::write(&path, b"fixture").unwrap();
+            path
+        }
+
+        fn command(&self, script: &str) -> Command {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", script, "noctalia-fixture"]);
+            command.env("FIXTURE_DIR", &self.0);
+            command
+        }
+    }
+
+    impl Drop for NoctaliaFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn noctalia_parses_one_literal_media_path() {
+        let fixture = NoctaliaFixture::new();
+        let path = fixture.media();
+        for ending in ["", "\n", "\r\n"] {
+            let response = format!("{}{ending}", path.display());
+            assert_eq!(
+                parse_noctalia_wallpaper(response.as_bytes()),
+                Some(path.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn noctalia_rejects_invalid_paths_and_non_file_results() {
+        let fixture = NoctaliaFixture::new();
+        let directory = fixture.0.join("directory.png");
+        fs::create_dir(&directory).unwrap();
+        let non_media = fixture.0.join("settings.toml");
+        fs::write(&non_media, b"fixture").unwrap();
+        let media = fixture.media();
+        for response in [
+            String::new(),
+            "\n".into(),
+            "color:#123456".into(),
+            "color:#12345678\n".into(),
+            "relative.png".into(),
+            fixture.0.join("missing.png").display().to_string(),
+            directory.display().to_string(),
+            non_media.display().to_string(),
+            format!("{}\nextra output\n", media.display()),
+            format!("\"{}\"", media.display()),
+            format!("error: {}", media.display()),
+        ] {
+            assert_eq!(
+                parse_noctalia_wallpaper(response.as_bytes()),
+                None,
+                "{response:?}"
+            );
+        }
+        assert_eq!(parse_noctalia_wallpaper(b"\xff\n"), None);
+    }
+
+    #[test]
+    fn noctalia_query_passes_arguments_and_preserves_path() {
+        let fixture = NoctaliaFixture::new();
+        let path = fixture.media();
+        let mut command = fixture.command(
+            "test \"$#\" = 2 && test \"$1\" = msg && test \"$2\" = wallpaper-get || exit 9; printf '%s\\n' \"$WALLPAPER\"",
+        );
+        command.env("WALLPAPER", &path);
+        assert_eq!(
+            query_noctalia_wallpaper(command, Duration::from_secs(2)),
+            Some(path)
+        );
+    }
+
+    #[test]
+    fn noctalia_query_falls_back_on_unavailable_or_invalid_ipc() {
+        let fixture = NoctaliaFixture::new();
+        let missing = Command::new(fixture.0.join("missing-noctalia"));
+        assert_eq!(
+            query_noctalia_wallpaper(missing, Duration::from_secs(2)),
+            None
+        );
+        for script in [
+            "printf 'error: noctalia is not running\\n' >&2; exit 1",
+            "printf '%s\\n' \"$WALLPAPER\"; exit 1",
+            "exit 0",
+            "printf 'invalid response\\n'",
+            "printf 'color:#123456\\n'",
+            "head -c 9000 /dev/zero",
+        ] {
+            let mut command = fixture.command(script);
+            command.env("WALLPAPER", fixture.media());
+            assert_eq!(
+                query_noctalia_wallpaper(command, Duration::from_secs(2)),
+                None,
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn noctalia_query_stops_and_reaps_a_timed_out_child() {
+        let fixture = NoctaliaFixture::new();
+        let command = fixture.command("printf '%s' \"$$\" > \"$FIXTURE_DIR/pid\"; exec sleep 30");
+        let started = Instant::now();
+        assert_eq!(
+            query_noctalia_wallpaper(command, Duration::from_millis(200)),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let pid: libc::pid_t = fs::read_to_string(fixture.0.join("pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        // SAFETY: signal zero checks this test child's existence without sending a signal.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
 
     fn make_temp_media_file(ext: &str) -> PathBuf {
         let dir = std::env::temp_dir().join("cava_bg_wallpaper_detector_tests");

@@ -339,6 +339,8 @@ For custom and fallback color palettes, see the `[colors]` block.
 - **Video Decoding** - Built-in fast software video decoding via `ffmpeg-next` allows multi-threaded playback of mp4 and other animated sources.
 
 ## Supported Wallpaper Tools & Managers
+
+- [Noctalia v5](docs/NOCTALIA.md)
 - awww
 - mpvpaper
 - hyprpaper
