@@ -9,6 +9,7 @@ mod layer_system;
 mod parallax_system;
 mod paths;
 mod perf_monitor;
+mod renderer_workers;
 mod supervisor;
 mod video_decoder;
 mod wallpaper;
