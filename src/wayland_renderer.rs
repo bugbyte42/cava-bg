@@ -3261,11 +3261,29 @@ impl AppState {
                 cfg.audio.mirror_gap,
             );
 
-            state.wgpu_queue.write_buffer(
-                &state.vertex_buffer,
-                0,
-                bytemuck::cast_slice(&frame_vertices),
-            );
+            let vertex_bytes: &[u8] = bytemuck::cast_slice(&frame_vertices);
+            let current_capacity = state.vertex_buffer.size();
+            let required_capacity = vertex_bytes.len() as wgpu::BufferAddress;
+            if required_capacity > current_capacity {
+                let capacity = bar_vertex_buffer_capacity(
+                    current_capacity,
+                    required_capacity,
+                    state.wgpu_device.limits().max_buffer_size,
+                );
+                debug!(
+                    "Growing bar vertex buffer for {} from {} to {} bytes",
+                    state.output_name, current_capacity, capacity
+                );
+                state.vertex_buffer = state.wgpu_device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Bars GPU Vertex Buffer"),
+                    size: capacity,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            state
+                .wgpu_queue
+                .write_buffer(&state.vertex_buffer, 0, vertex_bytes);
 
             let frame = match state.wgpu_surface.get_current_texture() {
                 Ok(f) => f,
@@ -3506,6 +3524,17 @@ fn update_hidden_video_frame(
     output_state.crop_scale = crop_scale;
     output_state.crop_offset = crop_offset;
     Ok(())
+}
+
+/// Keep existing capacity or round growth when the device limit permits.
+fn bar_vertex_buffer_capacity(current: u64, required: u64, device_limit: u64) -> u64 {
+    if required <= current {
+        return current;
+    }
+    required
+        .checked_next_power_of_two()
+        .filter(|&capacity| capacity <= device_limit)
+        .unwrap_or(required)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4111,5 +4140,116 @@ impl LayerShellHandler for AppState {
             self.persist_runtime_outputs();
             info!("Output {} ready: {}x{}", name, width, height);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_config::AudioConfig;
+
+    fn visualizer_bytes(
+        bar_count: u32,
+        mode: VisualizationMode,
+        shape: BarShape,
+        corner_segments: u32,
+    ) -> u64 {
+        let audio = AudioConfig {
+            bar_count,
+            visualization_mode: mode,
+            bar_shape: shape,
+            corner_segments,
+            ..AudioConfig::default()
+        };
+        let mut vertices = Vec::new();
+        build_visualizer_vertices(
+            &mut vertices,
+            &[0.5; 128],
+            audio.visualization_mode,
+            audio.bar_shape,
+            audio.corner_radius,
+            audio.corner_segments,
+            audio.polygon_sides,
+            false,
+            audio.gap,
+            audio.height_scale,
+            audio.bar_count.max(1) as usize,
+            audio.radial_inner_radius,
+            audio.radial_sweep_angle,
+            audio.waveform_line_width,
+            audio.waveform_smoothness,
+            audio.block_size,
+            audio.block_spacing,
+            audio.spiral_turns,
+            audio.mirror_gap,
+        );
+        std::mem::size_of_val(vertices.as_slice()) as u64
+    }
+
+    #[test]
+    fn bar_vertex_buffer_covers_geometry_after_config_changes() {
+        // Initial capacity for 128 rectangular bars, including mirrored geometry.
+        let mut capacity = 24_576;
+        let limit = 256 * 1024 * 1024;
+        let mut growths = 0;
+        let cases = [
+            (128, VisualizationMode::Bars, BarShape::Rectangle, 8),
+            (512, VisualizationMode::Bars, BarShape::Rectangle, 8),
+            (256, VisualizationMode::Bars, BarShape::Circle, 8),
+            (256, VisualizationMode::Bars, BarShape::Triangle, 8),
+            (256, VisualizationMode::MirrorBars, BarShape::Circle, 24),
+            (512, VisualizationMode::Spectrum, BarShape::Rectangle, 8),
+            (512, VisualizationMode::InvertedBars, BarShape::Triangle, 8),
+            (512, VisualizationMode::Blocks, BarShape::Rectangle, 8),
+            (512, VisualizationMode::Waveform, BarShape::Line, 8),
+            (128, VisualizationMode::Ring, BarShape::Rectangle, 8),
+            (512, VisualizationMode::Bars, BarShape::Line, 8),
+            (64, VisualizationMode::Bars, BarShape::Rectangle, 8),
+        ];
+        for (count, mode, shape, segments) in cases {
+            let required = visualizer_bytes(count, mode, shape, segments);
+            let next = bar_vertex_buffer_capacity(capacity, required, limit);
+            assert!(next >= required, "{count} bars, {mode:?}, {shape:?}");
+            assert!(next <= limit);
+            if required <= capacity {
+                assert_eq!(next, capacity, "A smaller frame must reuse the buffer");
+            } else {
+                growths += 1;
+            }
+            assert_eq!(bar_vertex_buffer_capacity(next, required, limit), next);
+            capacity = next;
+        }
+        assert!(growths >= 3, "Exercise multiple increases in geometry size");
+    }
+
+    #[test]
+    fn bar_vertex_buffer_covers_minimum_mode_geometry() {
+        for count in [0_u32, 1] {
+            for mode in [
+                VisualizationMode::Bars,
+                VisualizationMode::Blocks,
+                VisualizationMode::Waveform,
+                VisualizationMode::MirrorBars,
+                VisualizationMode::InvertedBars,
+                VisualizationMode::Spectrum,
+                VisualizationMode::Ring,
+            ] {
+                let required = visualizer_bytes(count, mode, BarShape::Rectangle, 8);
+                let initial = 12 * 4 * std::mem::size_of::<f32>() as u64;
+                let capacity = bar_vertex_buffer_capacity(initial, required, 256 * 1024 * 1024);
+                assert!(capacity >= required, "{count} bars, {mode:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn bar_vertex_buffer_growth_does_not_round_past_device_limit() {
+        let required = visualizer_bytes(512, VisualizationMode::Spectrum, BarShape::Rectangle, 8);
+        let limit = required + 16;
+        let capacity = bar_vertex_buffer_capacity(24_576, required, limit);
+        assert!(capacity >= required);
+        assert!(capacity <= limit);
+        assert_eq!(bar_vertex_buffer_capacity(capacity, 0, limit), capacity);
+        assert_eq!(bar_vertex_buffer_capacity(0, u64::MAX, u64::MAX), u64::MAX);
     }
 }
