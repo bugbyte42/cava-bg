@@ -20,6 +20,9 @@ pin a specific revision, and `--system` for a sudo'd install into
 `/usr/local/bin`. See "From Source" below for the full option list
 and the equivalent manual steps.
 
+When CAVA is missing, an interactive run asks before installing it with the system package manager and `sudo`.
+The default reply skips CAVA installation. Runs with piped input also skip it. Install CAVA separately for those runs.
+
 ## AUR (Arch Linux)
 
 ```bash

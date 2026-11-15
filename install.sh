@@ -384,17 +384,17 @@ check_cava() {
 install_cava() {
     echo "==> Installing cava..."
     if command -v pacman &> /dev/null; then
-        sudo pacman -S --noconfirm cava
+        sudo pacman -S cava
     elif command -v apt &> /dev/null; then
-        sudo apt update && sudo apt install -y cava
+        sudo apt update && sudo apt install cava
     elif command -v dnf &> /dev/null; then
-        sudo dnf install -y cava
+        sudo dnf install cava
     elif command -v zypper &> /dev/null; then
-        sudo zypper --non-interactive install cava
+        sudo zypper install cava
     elif command -v apk &> /dev/null; then
         sudo apk add cava
     elif command -v xbps-install &> /dev/null; then
-        sudo xbps-install -y cava
+        sudo xbps-install cava
     else
         echo "Warning: Could not detect a supported package manager."
         echo "Please install cava manually from: https://github.com/karlstav/cava"
@@ -410,12 +410,9 @@ if [ "$SKIP_CAVA" -eq 0 ]; then
             # post-install hook): never invoke sudo unattended, just say so.
             echo "Not a terminal: skipping cava installation."
             echo "Install it manually, then re-run cava-bg: https://github.com/karlstav/cava"
-        elif [ "$INSTALL_MODE" = "system" ] || [ "$INSTALL_MODE" = "user" ]; then
-            install_cava || echo "Warning: cava installation failed; continuing anyway."
         else
-            read -p "Install cava now? [Y/n] " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            if read -r -p "Install cava with the system package manager (requires sudo)? [y/N] " \
+                && [[ $REPLY =~ ^[Yy]([Ee][Ss])?$ ]]; then
                 install_cava || echo "Warning: cava installation failed; continuing anyway."
             else
                 echo "Skipping cava. The visualizer will not work without it."
