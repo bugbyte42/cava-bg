@@ -105,6 +105,8 @@ jobs:
           done
       - name: version.sh unit tests
         run: bash scripts/version.sh --test
+      - name: Installer consent tests
+        run: python3 scripts/test-installer.py
       - name: PKGBUILD must render from Cargo.toml
         run: |
           set -e

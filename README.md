@@ -98,7 +98,9 @@ The visualizer can save resources when no audio is playing:
 
 ### One-line Install (curl)
 
-The fastest way to install `cava-bg` on any Linux distribution. The script auto-detects your package manager, installs `cava`, builds the release binary, and installs completions.
+The script builds the release binary and installs shell completions.
+In an interactive run, it asks before installing missing `cava` through the system package manager with `sudo`.
+The default reply skips `cava` installation. Runs with piped input also skip it, so install `cava` separately for the command below.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/leriart/cava-bg/main/install.sh | bash
