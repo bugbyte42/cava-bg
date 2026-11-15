@@ -20,7 +20,7 @@
 #   --no-config           Skip creating the user configuration file
 #   --no-completions      Skip installing shell completions
 #   --binary              Try the GitHub release prebuilt tarball first,
-#                         fall back to source build if the asset is missing.
+#                         use source if missing; stop if verification fails.
 #                         Off by default; the curl | bash flow always
 #                         builds from source.
 #   --version <ref>       Ref to build from (default: main). Examples:
@@ -152,6 +152,7 @@ choose_install_dest() {
 }
 
 # ─── Optional: download prebuilt release binary (opt-in via --binary) ─────
+# Return 0 for success, 1 for source fallback, or 2 for a failed binary install.
 download_prebuilt() {
     if [ "$USE_BINARY" -eq 0 ]; then
         return 1
@@ -168,7 +169,11 @@ download_prebuilt() {
         return 1
     fi
 
-    TMP_DIR="$(mktemp -d -t cava-bg-XXXXXX)"
+    if ! TMP_DIR="$(mktemp -d -t cava-bg-XXXXXX)"; then
+        log_warn "Could not create a temporary directory for the prebuilt binary."
+        return 2
+    fi
+    trap 'rm -rf "$TMP_DIR"' EXIT
     ARCHIVE_PATH="$TMP_DIR/$ARCHIVE_NAME.tar.gz"
     EXTRACT_DIR="$TMP_DIR/extract"
 
@@ -189,21 +194,32 @@ download_prebuilt() {
         return 1
     fi
 
-    if curl --proto '=https' --tlsv1.2 -sSfL -o "$ARCHIVE_PATH.sha256" "${url}.sha256" 2>/dev/null; then
-        (cd "$TMP_DIR" && sha256sum -c "$ARCHIVE_PATH.sha256" 2>/dev/null) \
-            && log_info "Checksum OK" \
-            || log_warn "Checksum verification failed (continuing anyway)"
-    else
-        log_warn "No .sha256 published for this release; skipping checksum."
+    if ! curl --proto '=https' --tlsv1.2 -sSfL -o "$ARCHIVE_PATH.sha256" "${url}.sha256"; then
+        log_warn "Could not download the checksum. Stopping installation."
+        return 2
     fi
 
-    mkdir -p "$EXTRACT_DIR"
-    tar -xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR"
+    # Accept the single archive record produced by cava_bg_sha256.
+    local checksum_record
+    if ! checksum_record="$(cat "$ARCHIVE_PATH.sha256")" \
+        || [[ ! "$checksum_record" =~ ^[[:xdigit:]]{64}"  $ARCHIVE_NAME.tar.gz"$ ]]; then
+        log_warn "Invalid checksum record for $ARCHIVE_NAME.tar.gz. Stopping installation."
+        return 2
+    fi
+    if ! (cd "$TMP_DIR" && sha256sum -c "$ARCHIVE_PATH.sha256"); then
+        log_warn "Checksum verification failed. Stopping installation."
+        return 2
+    fi
+    log_info "Checksum OK"
+
+    if ! mkdir -p "$EXTRACT_DIR" || ! tar -xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR"; then
+        log_warn "Could not extract the prebuilt archive. Stopping installation."
+        return 2
+    fi
     local extracted_bin="$EXTRACT_DIR/$ARCHIVE_NAME/cava-bg"
     if [ ! -f "$extracted_bin" ]; then
         log_warn "Archive did not contain expected binary at $ARCHIVE_NAME/cava-bg"
-        rm -rf "$TMP_DIR"
-        return 1
+        return 2
     fi
     BIN_PATH="$extracted_bin"
     COMPLETIONS_DIR="$EXTRACT_DIR/$ARCHIVE_NAME/completions"
@@ -306,6 +322,10 @@ log_warn() { printf '   ! %s\n' "$*" >&2; }
 if download_prebuilt; then
     INSTALL_SOURCE="prebuilt $TARGET_REF"
 else
+    prebuilt_status=$?
+    if [ "$prebuilt_status" -ne 1 ]; then
+        exit "$prebuilt_status"
+    fi
     build_from_source
     INSTALL_SOURCE="built from source ($TARGET_REF)"
 fi
