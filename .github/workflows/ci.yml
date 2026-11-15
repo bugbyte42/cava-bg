@@ -103,6 +103,8 @@ jobs:
             echo "--- $s"
             bash -n "$s"
           done
+      - name: Prebuilt installer tests
+        run: python3 scripts/test-installer-binary.py
       - name: version.sh unit tests
         run: bash scripts/version.sh --test
       - name: Installer consent tests

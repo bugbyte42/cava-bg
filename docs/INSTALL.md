@@ -111,6 +111,12 @@ when a release tarball happens to lag behind a fix. The prebuilt
 GitHub release tarball is still available as an opt-in via `--binary`,
 but the default `curl | bash` flow does not use it.
 
+With `--binary`, the installer requires the archive checksum before extraction.
+A missing or invalid checksum stops installation. A checksum tool failure also stops installation.
+An unavailable archive permits a source build instead.
+Use `--version` with a release tag to request a prebuilt archive.
+The default `main` ref builds from source, including when `--binary` is set.
+
 ```bash
 # Latest source from main, user install
 curl -fsSL https://raw.githubusercontent.com/leriart/cava-bg/main/install.sh | bash
@@ -121,7 +127,7 @@ curl -fsSL https://raw.githubusercontent.com/leriart/cava-bg/main/install.sh | b
 # System-wide install (needs sudo)
 curl -fsSL https://raw.githubusercontent.com/leriart/cava-bg/main/install.sh | bash -s -- --system
 
-# Opt into the prebuilt release tarball (still falls back to source build)
+# Enable prebuilt downloads for release refs; main still builds from source.
 curl -fsSL https://raw.githubusercontent.com/leriart/cava-bg/main/install.sh | bash -s -- --binary
 ```
 
