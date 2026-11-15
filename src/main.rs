@@ -4,6 +4,7 @@ mod app_config;
 mod bar_geometry;
 mod cli;
 mod config_gui;
+mod config_recovery;
 mod layer_finder;
 mod layer_system;
 mod parallax_system;
@@ -38,6 +39,7 @@ use std::time::{Duration, Instant};
 
 use app_config::Config;
 use config_gui::run_config_gui;
+use config_recovery::ConfigRecovery;
 use wayland_renderer::WaylandRenderer;
 
 static HEARTBEAT_TICK: AtomicU64 = AtomicU64::new(0);
@@ -1009,7 +1011,7 @@ fn run_foreground(
 
     let config_str = fs::read_to_string(&config_path)
         .with_context(|| format!("Unable to read config file: {:?}", config_path))?;
-    let mut config: Config = match toml::from_str(&config_str) {
+    let config: Config = match toml::from_str(&config_str) {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
@@ -1032,9 +1034,8 @@ fn run_foreground(
                 .with_context(|| "Fresh config failed to parse (this shouldn\'t happen)")?
         }
     };
-    config.normalize_compat_fields();
+    let config_recovery = ConfigRecovery::new(config, output_filter.clone());
     if let Some(output_name) = &output_filter {
-        config.general.preferred_outputs = vec![output_name.clone()];
         daemon_debug_log(
             debug_mode,
             systemd_mode,
@@ -1092,8 +1093,23 @@ fn run_foreground(
     }
 
     let mut restart_attempt: u64 = 0;
+    let mut last_config_error = None;
     while running.load(Ordering::SeqCst) {
         restart_attempt += 1;
+        let config = match config_recovery.reload(&config_path) {
+            Ok(config) => {
+                last_config_error = None;
+                config
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                if last_config_error.as_ref() != Some(&message) {
+                    warn!("Keeping the last valid config during renderer recovery: {message}");
+                    last_config_error = Some(message);
+                }
+                config_recovery.latest()
+            }
+        };
         daemon_debug_log(
             debug_mode,
             systemd_mode,
@@ -1113,6 +1129,7 @@ fn run_foreground(
                 running.clone(),
                 Some(config_path.clone()),
                 supervised,
+                config_recovery.clone(),
             );
             renderer.run()
         }));

@@ -190,6 +190,7 @@ use crate::app_config::{
     OutputDescriptor, PaletteType, ProfileSource, VisualizationMode, XRayConfig,
 };
 use crate::bar_geometry;
+use crate::config_recovery::ConfigRecovery;
 use crate::heartbeat_tick;
 use crate::parallax_system::{AudioBands, ComputedParallaxLayer, ParallaxSystem};
 use crate::perf_monitor::PerfMonitor;
@@ -524,6 +525,7 @@ fn compute_display_anchor(disp: &crate::app_config::DisplayConfig) -> Anchor {
 
 pub struct WaylandRenderer {
     config: Config,
+    config_recovery: ConfigRecovery,
     running: Arc<AtomicBool>,
     config_path: Option<PathBuf>,
     cava_handle: Option<std::process::Child>,
@@ -537,9 +539,11 @@ impl WaylandRenderer {
         running: Arc<AtomicBool>,
         config_path: Option<PathBuf>,
         supervised: bool,
+        config_recovery: ConfigRecovery,
     ) -> Self {
         Self {
             config,
+            config_recovery,
             running,
             config_path,
             cava_handle: None,
@@ -1015,6 +1019,7 @@ impl WaylandRenderer {
             layer_shell,
             compositor,
             base_config: self.config.clone(),
+            config_recovery: self.config_recovery.clone(),
             per_output: HashMap::new(),
             next_output_index: 0,
             runtime_outputs_path,
@@ -1363,6 +1368,7 @@ struct AppState {
     layer_shell: LayerShell,
     compositor: CompositorState,
     base_config: Config,
+    config_recovery: ConfigRecovery,
     per_output: HashMap<String, PerOutputState>,
     next_output_index: u32,
     runtime_outputs_path: Option<PathBuf>,
@@ -1736,6 +1742,7 @@ impl AppState {
     }
 
     fn apply_runtime_config(&mut self, new_config: Config) {
+        let new_config = self.config_recovery.remember(new_config);
         self.base_config = new_config.clone();
         self.bar_gap = new_config.audio.gap;
         self.bar_alpha = new_config.audio.bar_alpha;
