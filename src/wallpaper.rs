@@ -7,12 +7,14 @@ use once_cell::sync::Lazy;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::app_config::ColorExtractionMode;
+use crate::renderer_workers::RendererWorkers;
 use crate::wallpaper_detector;
 
 static PREVIOUS_COLORS: Lazy<Mutex<Vec<[f32; 4]>>> = Lazy::new(|| Mutex::new(Vec::new()));
@@ -343,46 +345,50 @@ fn watch_step() -> (WatchTick, Duration) {
 
 impl WallpaperAnalyzer {
     pub fn start_wallpaper_monitor(
+        workers: &mut RendererWorkers,
         tx: Sender<Vec<[f32; 4]>>,
         num_colors: usize,
         extraction_mode: ColorExtractionMode,
         extract_enabled: bool,
     ) {
-        thread::spawn(move || loop {
-            // Only extract when extract_enabled is true OR if we haven't sent initial colors
-            // (fallback for when parallax/xray have no wallpaper)
-            let wants_extraction = extract_enabled || !initial_colors_sent();
+        workers.spawn(move |running| {
+            while running.load(Ordering::SeqCst) {
+                // Only extract when extract_enabled is true OR if we haven't sent initial colors
+                // (fallback for when parallax/xray have no wallpaper)
+                let wants_extraction = extract_enabled || !initial_colors_sent();
 
-            match watch_step() {
-                (WatchTick::Changed { .. }, _) if wants_extraction => {
-                    match Self::generate_gradient_colors(num_colors, Some(extraction_mode)) {
-                        Ok(colors) => {
-                            if tx.send(colors).is_err() {
-                                break;
+                match watch_step() {
+                    (WatchTick::Changed { .. }, _) if wants_extraction => {
+                        match Self::generate_gradient_colors(num_colors, Some(extraction_mode)) {
+                            Ok(colors) => {
+                                if tx.send(colors).is_err() {
+                                    break;
+                                }
+                                mark_initial_colors_sent();
                             }
-                            mark_initial_colors_sent();
+                            Err(e) => log::error!("Failed to generate colors: {}", e),
                         }
-                        Err(e) => log::error!("Failed to generate colors: {}", e),
                     }
+                    (WatchTick::Disappeared, _) => {
+                        log::warn!("Wallpaper disappeared, using default colors");
+                        let _ = tx.send(Self::default_colors(num_colors));
+                    }
+                    (_, stable_for) => thread::sleep(poll_interval(stable_for)),
                 }
-                (WatchTick::Disappeared, _) => {
-                    log::warn!("Wallpaper disappeared, using default colors");
-                    let _ = tx.send(Self::default_colors(num_colors));
-                }
-                (_, stable_for) => thread::sleep(poll_interval(stable_for)),
             }
         });
     }
 
     pub fn start_wallpaper_path_monitor(
+        workers: &mut RendererWorkers,
         tx: Sender<Option<PathBuf>>,
         color_tx: Option<Sender<Vec<[f32; 4]>>>,
         num_colors: usize,
         extraction_mode: ColorExtractionMode,
     ) {
-        thread::spawn(move || {
+        workers.spawn(move |running| {
             let mut reported: Option<Option<PathBuf>> = None;
-            loop {
+            while running.load(Ordering::SeqCst) {
                 let (tick, stable_for) = watch_step();
 
                 match tick {

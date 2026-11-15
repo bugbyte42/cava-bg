@@ -47,6 +47,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::renderer_workers::RendererWorkers;
+
 fn build_cava_config(config: &Config) -> String {
     let cava_config = CavaConfig {
         general: CavaGeneralConfig {
@@ -572,10 +574,10 @@ impl WaylandRenderer {
 
     fn spawn_color_update_listener_thread(
         config_path: PathBuf,
-        running: Arc<AtomicBool>,
+        workers: &mut RendererWorkers,
         color_update_tx: Sender<ColorUpdatePayload>,
     ) {
-        thread::spawn(move || {
+        workers.spawn(move |running| {
             let paths = crate::paths::RuntimePaths::new(&config_path);
             let socket_path = paths.color_socket();
             if let Err(e) = paths.ensure_dir() {
@@ -636,10 +638,10 @@ impl WaylandRenderer {
 
     fn spawn_config_hot_reload_thread(
         config_path: PathBuf,
-        running: Arc<AtomicBool>,
+        workers: &mut RendererWorkers,
         config_update_tx: Sender<Config>,
     ) {
-        thread::spawn(move || {
+        workers.spawn(move |running| {
             let mut last_modified = std::fs::metadata(&config_path)
                 .and_then(|m| m.modified())
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
@@ -825,6 +827,7 @@ impl WaylandRenderer {
     pub fn run(self) -> Result<()> {
         info!("Starting cava-bg with wgpu backend");
 
+        let mut workers = RendererWorkers::default();
         let mut cmd = spawn_cava_process(&self.config)?;
 
         let (_framerate_tx, framerate_rx) = channel::<f64>();
@@ -836,12 +839,12 @@ impl WaylandRenderer {
         if let Some(ref config_path) = self.config_path {
             Self::spawn_config_hot_reload_thread(
                 config_path.clone(),
-                self.running.clone(),
+                &mut workers,
                 config_update_tx,
             );
             Self::spawn_color_update_listener_thread(
                 config_path.clone(),
-                self.running.clone(),
+                &mut workers,
                 color_update_tx,
             );
         }
@@ -868,6 +871,7 @@ impl WaylandRenderer {
         let (color_tx, color_receiver) = channel();
         let color_tx_for_path = color_tx.clone();
         WallpaperAnalyzer::start_wallpaper_monitor(
+            &mut workers,
             color_tx,
             num_colors,
             extraction_mode,
@@ -877,7 +881,7 @@ impl WaylandRenderer {
         // External cursor monitor — reads cursor position via hyprctl.
         // This works even when the cursor is over other windows.
         let (cursor_tx, cursor_rx) = channel::<(f32, f32)>();
-        AppState::start_cursor_monitor(cursor_tx);
+        AppState::start_cursor_monitor(&mut workers, cursor_tx);
 
         let use_dynamic = self.config.general.dynamic_colors;
         let initial_colors = if use_dynamic {
@@ -957,6 +961,7 @@ impl WaylandRenderer {
                 None
             };
             WallpaperAnalyzer::start_wallpaper_path_monitor(
+                &mut workers,
                 tx,
                 color_tx,
                 num_colors,
@@ -1464,13 +1469,14 @@ impl AppState {
     ///
     /// `poll` returns `Option<(f32, f32)>` in normalised 0..1 coordinates.
     fn spawn_adaptive_cursor_poller(
+        workers: &mut RendererWorkers,
         name: &'static str,
         poll: impl Fn() -> Option<(f32, f32)> + Send + 'static,
         tx: Sender<(f32, f32)>,
     ) {
-        std::thread::spawn(move || {
+        workers.spawn(move |running| {
             let mut last: Option<(f32, f32)> = None;
-            loop {
+            while running.load(Ordering::SeqCst) {
                 if let Some(pos) = poll() {
                     let moved = last
                         .map(|p| (p.0 - pos.0).abs() > 1e-4 || (p.1 - pos.1).abs() > 1e-4)
@@ -1498,14 +1504,14 @@ impl AppState {
     /// Starts a background thread that periodically reads the cursor position
     /// via `hyprctl cursorpos`. Works across all windows, not just cava-bg's surface.
     /// Falls back silently if hyprctl isn't available.
-    fn start_cursor_monitor(tx: Sender<(f32, f32)>) {
+    fn start_cursor_monitor(workers: &mut RendererWorkers, tx: Sender<(f32, f32)>) {
         // Try hyprctl first (Hyprland)
-        if Self::try_hyprctl_cursor(tx.clone()).is_some() {
+        if Self::try_hyprctl_cursor(workers, tx.clone()).is_some() {
             return;
         }
 
         // Try wlrctl (wlroots-based compositors: Sway, River, Wayfire, etc.)
-        if Self::try_wlrctl_cursor(tx.clone()).is_some() {
+        if Self::try_wlrctl_cursor(workers, tx.clone()).is_some() {
             return;
         }
 
@@ -1521,7 +1527,7 @@ impl AppState {
     }
 
     /// Try to get cursor position via `hyprctl cursorpos`
-    fn try_hyprctl_cursor(tx: Sender<(f32, f32)>) -> Option<()> {
+    fn try_hyprctl_cursor(workers: &mut RendererWorkers, tx: Sender<(f32, f32)>) -> Option<()> {
         let has_hyprctl = std::process::Command::new("which")
             .arg("hyprctl")
             .output()
@@ -1564,6 +1570,7 @@ impl AppState {
 
         let (res_w, res_h) = resolution;
         Self::spawn_adaptive_cursor_poller(
+            workers,
             "hyprctl",
             move || {
                 let output = std::process::Command::new("hyprctl")
@@ -1581,7 +1588,7 @@ impl AppState {
     }
 
     /// Try to get cursor position via `wlrctl pointer` (wlroots compositors)
-    fn try_wlrctl_cursor(tx: Sender<(f32, f32)>) -> Option<()> {
+    fn try_wlrctl_cursor(workers: &mut RendererWorkers, tx: Sender<(f32, f32)>) -> Option<()> {
         let has_wlrctl = std::process::Command::new("which")
             .arg("wlrctl")
             .output()
@@ -1625,6 +1632,7 @@ impl AppState {
 
         let (res_w, res_h) = resolution;
         Self::spawn_adaptive_cursor_poller(
+            workers,
             "wlrctl",
             move || {
                 let output = std::process::Command::new("wlrctl")
@@ -4398,5 +4406,119 @@ mod cava_teardown_tests {
                 .unwrap();
         }
         assert_reaped(pid);
+    }
+}
+
+#[cfg(test)]
+mod renderer_worker_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "cbg-workers-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn idle_config_watcher_stops_without_another_file_change() {
+        let dir = TestDirectory::new();
+        let path = dir.0.join("config.toml");
+        let mut workers = RendererWorkers::default();
+        let (tx, rx) = channel();
+        WaylandRenderer::spawn_config_hot_reload_thread(path.clone(), &mut workers, tx);
+        let mut config = Config::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            config.audio.bar_count += 1;
+            std::fs::write(&path, crate::app_config::serialize_config(&config).unwrap()).unwrap();
+            if rx.recv_timeout(Duration::from_millis(100)).is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "config watcher did not reload");
+        }
+        drop(workers);
+        rx.try_iter().for_each(drop);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn color_listener_exits_before_replacement_socket_is_bound() {
+        let dir = TestDirectory::new();
+        let path = dir.0.join("config.toml");
+        let socket_path = crate::paths::RuntimePaths::new(&path).color_socket();
+        let client = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        for _ in 0..3 {
+            let mut workers = RendererWorkers::default();
+            let (tx, rx) = channel();
+            WaylandRenderer::spawn_color_update_listener_thread(path.clone(), &mut workers, tx);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let payload = br#"{"colors":[[0.2,0.3,0.4,1.0]],"bar_alpha":0.28}"#;
+            while client.send_to(payload, &socket_path).is_err() {
+                assert!(Instant::now() < deadline, "color listener did not bind");
+                thread::sleep(Duration::from_millis(5));
+            }
+            let update = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(update.bar_alpha, Some(0.28));
+            drop(workers);
+            assert!(!socket_path.exists());
+            assert!(matches!(
+                rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ));
+        }
+    }
+
+    #[test]
+    fn stationary_cursor_poller_stops_without_more_movement() {
+        let mut workers = RendererWorkers::default();
+        let (tx, rx) = channel();
+        AppState::spawn_adaptive_cursor_poller(&mut workers, "test", || Some((0.5, 0.5)), tx);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), (0.5, 0.5));
+        drop(workers);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn unavailable_cursor_poller_stops_without_a_successful_poll() {
+        let mut workers = RendererWorkers::default();
+        let (ready_tx, ready_rx) = channel();
+        let (tx, rx) = channel();
+        AppState::spawn_adaptive_cursor_poller(
+            &mut workers,
+            "test",
+            move || {
+                let _ = ready_tx.send(());
+                None
+            },
+            tx,
+        );
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(workers);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
     }
 }
